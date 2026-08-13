@@ -78,6 +78,7 @@ Also added:
 
 - Historical resolver is tiered: direct start ID -> `/racing/list` -> `/racing/meetings` -> browser-side form-history reconstruction.
 - Older TAB dates that reject race-list requests no longer have to fail completely.
+- commit
 - Form-history reconstruction cross-matches all runners in the selected upcoming field by date, venue, distance and class.
 - Resolved races now go into an editable staging panel before **Add to Edit Sheet**.
 - Historical media code is editable and prefers `last_starts.track_four_char` where available.
