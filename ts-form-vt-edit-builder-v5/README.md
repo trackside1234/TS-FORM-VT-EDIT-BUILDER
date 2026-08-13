@@ -96,6 +96,7 @@ The resolver now tries, in order:
 5. if a historical meeting is available but full event data is not, infer the race number when venue + distance leaves exactly one matching race;
 6. finally reconstruct arrows from the upcoming field's own form histories.
 7. rebuild app
+8. updates
 
 The `/racing/races` endpoint is useful because its schema explicitly returns `event_id`, `meeting_name` and `race_number`.
 -commit
