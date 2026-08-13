@@ -97,6 +97,7 @@ The resolver now tries, in order:
 6. finally reconstruct arrows from the upcoming field's own form histories.
 
 The `/racing/races` endpoint is useful because its schema explicitly returns `event_id`, `meeting_name` and `race_number`.
+-commit
 
 ### Internal media codes
 `track_four_char` from TAB is no longer used to populate editor media codes. It is a TAB identifier and can conflict with internal media-storage codes.
