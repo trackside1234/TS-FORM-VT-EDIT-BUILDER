@@ -1,6 +1,6 @@
 name = "ts-form-vt-edit-builder"
 main = "src/index.js"
-compatibility_date = "2026-08-14"
+compatibility_date = "2026-08-13"
 
 [assets]
 directory = "./public"
