@@ -634,6 +634,5 @@ Fixes v32's `Current HRNZ meeting/race identifiers are missing`.
 - Generic event normalization preserves `meeting_id` and `race_id`.
 - If either is absent but `event_id` has `hrnz:MEETING:RACE`, IDs are recovered from it.
 - Harness public-racebook history loader now reports the actual ID values if they are still missing.
-- update commit
 
 No Thoroughbred logic changes.
