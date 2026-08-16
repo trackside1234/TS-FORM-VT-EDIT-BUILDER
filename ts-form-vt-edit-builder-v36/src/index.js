@@ -1,0 +1,1261 @@
+const TAB_BASE = "https://api.tab.co.nz/affiliates/v1/racing";
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+function cleanDate(v){ return /^\d{4}-\d{2}-\d{2}$/.test(v||"") ? v : null; }
+function cleanUUID(v){ return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v||"") ? v : null; }
+function norm(s){ return String(s||"").toLowerCase().replace(/[^a-z0-9]/g,""); }
+
+async function tabJSON(url){
+  const r = await fetch(url,{headers:{accept:"application/json","user-agent":"TS-Form-VT-Edit-Builder/36.0"}});
+  const text = await r.text();
+  let data; try{data=JSON.parse(text)}catch{data={raw:text}}
+  if(!r.ok){
+    const detail=data?.error||data?.message||data?.raw||"request failed";
+    const err=new Error(`TAB ${r.status}: ${typeof detail==="string"?detail:"request failed"}`);
+    err.status=r.status; err.upstream=url; err.body=data;
+    throw err;
+  }
+  return data;
+}
+async function meetingsFor(date,country="NZ",category="T"){
+  const u=new URL(`${TAB_BASE}/meetings`);
+  u.searchParams.set("category",category==="H"?"H":"T");
+  if(country) u.searchParams.set("country",country);
+  u.searchParams.set("date_from",date); u.searchParams.set("date_to",date);
+  u.searchParams.set("enc","json"); u.searchParams.set("limit","200");
+  return tabJSON(u.toString());
+}
+async function racesFor(date,country="NZ",category="T"){
+  const u=new URL(`${TAB_BASE}/list`);
+  if(country) u.searchParams.set("countries",country);
+  u.searchParams.set("meet_types",category==="H"?"H":"T");
+  u.searchParams.set("date_from",date);
+  u.searchParams.set("date_to",date);
+  u.searchParams.set("enc","json");
+  u.searchParams.set("limit","200");
+  return tabJSON(u.toString());
+}
+async function channelRacesFor(date,category="T"){
+  const channels=["Trackside1","Trackside2","Live1","Live2","NoVideos"];
+  const byId=new Map();
+  const errors=[];
+  for(const channel of channels){
+    const u=new URL(`${TAB_BASE}/races`);
+    u.searchParams.set("channel",channel);
+    u.searchParams.set("date",date);
+    u.searchParams.set("type",category==="H"?"H":"T");
+    u.searchParams.set("enc","json");
+    try{
+      const p=await tabJSON(u.toString());
+      const races=p?.data?.races || p?.races || [];
+      for(const r of races){
+        const id=r.event_id||r.id;
+        if(id && !byId.has(String(id))) byId.set(String(id),r);
+      }
+    }catch(err){
+      errors.push({channel,message:err?.message||String(err),url:err?.upstream||u.toString()});
+    }
+  }
+  return {races:[...byId.values()],errors};
+}
+
+function lrStrip(s){
+  return String(s||"")
+    .replace(/<script[\s\S]*?<\/script>/gi," ")
+    .replace(/<style[\s\S]*?<\/style>/gi," ")
+    .replace(/<[^>]+>/g," ")
+    .replace(/&nbsp;|&#160;/gi," ")
+    .replace(/&amp;/gi,"&")
+    .replace(/&#39;|&apos;/gi,"'")
+    .replace(/&quot;/gi,'"')
+    .replace(/\s+/g," ").trim();
+}
+function lrNorm(s){
+  return lrStrip(s).toLowerCase().normalize("NFD")
+    .replace(/[\u0300-\u036f]/g,"")
+    .replace(/[^a-z0-9]+/g," ").trim();
+}
+function lrEstimateMeetingId(date){
+  // Public anchors: 7 Mar 2026 = 54916; 12 Aug 2026 = 55913.
+  const a=new Date("2026-03-07T00:00:00Z");
+  const d=new Date(`${date}T00:00:00Z`);
+  const days=Math.round((d-a)/86400000);
+  return Math.round(54916 + days*(997/158));
+}
+function lrPageMatchesDate(html,date){
+  const t=lrNorm(html);
+  const [y,m,d]=date.split("-").map(Number);
+  const months=["","january","february","march","april","may","june","july","august","september","october","november","december"];
+  const full=`${d} ${months[m]} ${y}`;
+  const short=`${d} ${months[m].slice(0,3)} ${y}`;
+  return t.includes(full)||t.includes(short);
+}
+function lrVenueFromHtml(html){
+  const patterns=[
+    /@\s*([^<\r\n]+?)\s+Last updated/i,
+    /Race Meeting for [^<]+? at ([^<]+?) on \d{1,2}\s+[A-Z]{3}\s+\d{4}/i,
+    /Courses?[^<]{0,100}@\s*([^<\r\n]+)/i
+  ];
+  for(const rx of patterns){
+    const m=html.match(rx);
+    if(m && m[1]) return lrStrip(m[1]).trim();
+  }
+  const text=lrStrip(html);
+  const m=text.match(/@\s*([A-Za-zĀ-ž' -]{3,60})\s+Last updated/i);
+  return m?.[1]?.trim()||"";
+}
+function lrRaceNumberFromHtml(html,distance,horseName){
+  const dist=String(distance||"").replace(/\D/g,"");
+  const horse=lrNorm(horseName);
+  const links=[];
+  const rx=/href=["']([^"']*\/RaceInfo\/(\d+)\/(\d+)\/Race-Detail\.aspx[^"']*)["']/gi;
+  let m;
+  while((m=rx.exec(html))){
+    const ctx=lrStrip(html.slice(Math.max(0,m.index-1700),Math.min(html.length,m.index+2400)));
+    const nctx=lrNorm(ctx);
+    let score=0;
+    if(dist && new RegExp(`\\b${dist}\\s*m\\b`,"i").test(ctx)) score+=4;
+    if(horse && nctx.includes(horse)) score+=8;
+    links.push({race_number:Number(m[3]),score});
+  }
+  links.sort((a,b)=>b.score-a.score);
+  if(links.length && links[0].score>=4) return links[0].race_number;
+
+  if(dist){
+    const text=lrStrip(html);
+    const found=[];
+    const rxs=[
+      new RegExp(`(?:race\\s*)?(\\d{1,2})[^\\n]{0,220}?\\b${dist}\\s*m\\b`,"ig"),
+      new RegExp(`\\b(\\d{1,2})\\b[^\\n]{0,220}?\\b${dist}\\s*m\\b`,"ig")
+    ];
+    for(const r of rxs){
+      let z;
+      while((z=r.exec(text))){
+        const n=Number(z[1]);
+        if(n>=1 && n<=20) found.push(n);
+      }
+      const u=[...new Set(found)];
+      if(u.length===1) return u[0];
+    }
+  }
+  return null;
+}
+
+function lrRaceNumberFromOverview(html,meetingId,horseName){
+  const horse=lrNorm(horseName);
+  if(!horse) return null;
+
+  // Completed meeting overviews contain final Race-Detail links followed by
+  // the complete result block for that race.
+  const rx=new RegExp(`(?:/)?RaceInfo/${meetingId}/(\\d{1,2})/Race-Detail\\.aspx`,"ig");
+  const links=[];
+  let m;
+  while((m=rx.exec(html))){
+    const n=Number(m[1]);
+    if(n>=1 && n<=30) links.push({race_number:n,index:m.index});
+  }
+
+  // Collapse repeats of the same race link.
+  const ordered=[];
+  for(const x of links.sort((a,b)=>a.index-b.index)){
+    if(!ordered.length || ordered[ordered.length-1].race_number!==x.race_number){
+      ordered.push(x);
+    }
+  }
+
+  for(let i=0;i<ordered.length;i++){
+    const cur=ordered[i];
+    const end=i+1<ordered.length ? ordered[i+1].index : html.length;
+    const section=html.slice(cur.index,end);
+    if(lrNorm(section).includes(horse)){
+      return {race_number:cur.race_number,source:"overview_race_section"};
+    }
+  }
+  return null;
+}
+
+async function loveRacingResolve(date,venue,distance,horseName){
+  const estimate=lrEstimateMeetingId(date);
+  const offsets=[0,1,-1,2,-2,3,-3,5,-5,8,-8,12,-12,16,-16,20,-20,25,-25,30,-30];
+  const candidates=[];
+
+  for(const off of offsets){
+    const id=estimate+off;
+    if(id<1) continue;
+    const url=`https://loveracing.nz/RaceInfo/${id}/Meeting-Overview.aspx`;
+    try{
+      const r=await fetch(url,{
+        headers:{accept:"text/html","user-agent":"TS-Form-VT-Edit-Builder/36.0"},
+        redirect:"follow"
+      });
+      if(!r.ok) continue;
+      const html=await r.text();
+      if(!lrPageMatchesDate(html,date)) continue;
+
+      const humanVenue=lrVenueFromHtml(html) || venue;
+      const parsed=lrRaceNumberFromOverview(html,id,horseName);
+
+      let score=1;
+      const incoming=lrNorm(venue), actual=lrNorm(humanVenue);
+      if(incoming && actual && (actual.includes(incoming)||incoming.includes(actual))) score+=4;
+      if(parsed?.race_number) score+=10;
+
+      candidates.push({
+        ok:true,
+        meeting_id:id,
+        venue:humanVenue,
+        race_number:parsed?.race_number||null,
+        url,
+        source:parsed?.source||"meeting_only",
+        score
+      });
+    }catch{}
+  }
+
+  candidates.sort((a,b)=>b.score-a.score);
+  if(candidates.length) return candidates[0];
+  return {ok:false,estimate};
+}
+
+
+function rasVenueSlug(v){
+  return String(v||"")
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
+    .replace(/[^a-z0-9]+/g,"-")
+    .replace(/^-+|-+$/g,"");
+}
+async function racingAndSportsResolve(date,venue,horseName,distance){
+  const horse=lrNorm(horseName);
+  const slug=rasVenueSlug(venue);
+  const dist=String(distance||"").replace(/\D/g,"");
+  if(!slug || !horse) return {ok:false,reason:"missing venue/horse"};
+
+  // The URL itself fixes venue + exact date + race number.
+  // We accept a race number only if the selected horse is actually present on that page.
+  for(let raceNo=1; raceNo<=20; raceNo++){
+    const url=`https://www.racingandsports.com.au/horse-racing-results/new-zealand/${slug}/${date}/r${raceNo}`;
+    try{
+      const r=await fetch(url,{
+        headers:{
+          accept:"text/html",
+          "user-agent":"Mozilla/5.0 (compatible; TS-Form-VT-Edit-Builder/36.0)"
+        },
+        redirect:"follow"
+      });
+      if(!r.ok) continue;
+
+      const html=await r.text();
+      const text=lrNorm(html);
+
+      // Horse + exact venue/date URL is the deciding check.
+      if(!text.includes(horse)) continue;
+
+      // Distance is diagnostic/supporting only because historical feeds can disagree.
+      let distanceMatch=null;
+      if(dist){
+        const plain=lrStrip(html);
+        distanceMatch=new RegExp(`\\b${dist}\\s*m\\b`,"i").test(plain);
+      }
+
+      return {
+        ok:true,
+        race_number:raceNo,
+        venue,
+        url,
+        source:"racing_and_sports_verified_horse_date_venue",
+        confidence:"high",
+        distanceMatch
+      };
+    }catch{}
+  }
+
+  return {
+    ok:false,
+    venue,
+    source:"racing_and_sports_no_verified_horse_match"
+  };
+}
+
+
+function ddmmyyWorker(date){
+  const m=String(date||"").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[3]}${m[2]}${m[1].slice(2)}` : "";
+}
+async function breednetResolve(date,trackCode,horseName,distance,humanVenue){
+  const horse=lrNorm(horseName);
+  const venue=String(humanVenue||"").trim();
+  const slug=rasVenueSlug(venue);
+  if(!slug || !horse) return {ok:false,reason:"missing human venue/horse"};
+
+  const urls=[
+    `https://www.breednet.com.au/race-results/new-zealand/${slug}/${date}`,
+    `https://www.breednet.com.au/race-results/${slug}/${date}`
+  ];
+
+  for(const url of urls){
+    try{
+      const r=await fetch(url,{
+        headers:{
+          accept:"text/html",
+          "user-agent":"Mozilla/5.0 (compatible; TS-Form-VT-Edit-Builder/36.0)"
+        },
+        redirect:"follow"
+      });
+      if(!r.ok) continue;
+
+      const html=await r.text();
+      const plain=lrStrip(html);
+      const nplain=lrNorm(plain);
+      if(!nplain.includes(horse)) continue;
+
+      // Split the full meeting page by explicit final result headings: "Race N - ..."
+      const matches=[...plain.matchAll(/\bRace\s+(\d{1,2})\s*-/gi)];
+      for(let i=0;i<matches.length;i++){
+        const raceNo=Number(matches[i][1]);
+        if(raceNo<1 || raceNo>30) continue;
+        const start=matches[i].index;
+        const end=i+1<matches.length ? matches[i+1].index : plain.length;
+        const section=plain.slice(start,end);
+        if(lrNorm(section).includes(horse)){
+          return {
+            ok:true,
+            race_number:raceNo,
+            venue,
+            url,
+            source:"breednet_full_meeting_result_section",
+            confidence:"high"
+          };
+        }
+      }
+
+      // Fallback: horse exists on page but parser couldn't assign its section.
+      return {
+        ok:false,
+        venue,
+        url,
+        source:"breednet_horse_found_section_unresolved"
+      };
+    }catch(err){}
+  }
+  return {ok:false,venue,source:"breednet_meeting_not_found_or_horse_absent"};
+}
+
+
+const HRNZ_BASE="https://harness.hrnz.co.nz/gws/ws/r/infohorsews/API-1.1";
+let hrnzKeyCache={key:"",expires:0};
+
+function hrnzConfigured(env){
+  return !!(env?.HRNZ_BASIC_USER && env?.HRNZ_BASIC_PASS);
+}
+async function hrnzGetKey(env,force=false){
+  if(!hrnzConfigured(env)) throw new Error("HRNZ Basic Auth is not configured in Cloudflare secrets");
+  const now=Date.now();
+  if(!force && hrnzKeyCache.key && hrnzKeyCache.expires>now+3600000) return hrnzKeyCache.key;
+
+  const basic=btoa(`${env.HRNZ_BASIC_USER}:${env.HRNZ_BASIC_PASS}`);
+  const r=await fetch(`${HRNZ_BASE}/security/hrkey`,{
+    headers:{accept:"application/json",authorization:`Basic ${basic}`}
+  });
+  const text=await r.text();
+  if(!r.ok) throw new Error(`HRNZ key request failed ${r.status}: ${text.slice(0,180)}`);
+  let j;
+  try{j=JSON.parse(text)}catch{throw new Error("HRNZ key response was not JSON")}
+  const key=j?.hrKey;
+  if(!key) throw new Error("HRNZ key response did not contain hrKey");
+  const exp=Date.parse(j?.dateExpires||"") || (now+55*24*3600000);
+  hrnzKeyCache={key,expires:exp};
+  return key;
+}
+async function hrnzJSON(env,path,params={}){
+  let key=await hrnzGetKey(env);
+  const u=new URL(`${HRNZ_BASE}${path}`);
+  for(const [k,v] of Object.entries(params)){
+    if(v!==undefined && v!==null && v!=="") u.searchParams.set(k,String(v));
+  }
+  let r=await fetch(u,{headers:{accept:"application/json","X-HR-KEY":key}});
+  if(r.status===401 || r.status===403){
+    hrnzKeyCache={key:"",expires:0};
+    key=await hrnzGetKey(env,true);
+    r=await fetch(u,{headers:{accept:"application/json","X-HR-KEY":key}});
+  }
+  const text=await r.text();
+  if(!r.ok) throw new Error(`HRNZ ${r.status}: ${text.slice(0,180)}`);
+  try{return JSON.parse(text)}catch{throw new Error("HRNZ response was not JSON")}
+}
+function hrnzDistance(x){
+  return x?.distance?.distance ?? x?.distance ?? "";
+}
+function hrnzMeetingName(m){
+  const raw=String(m?.track?.name || m?.trackName || m?.clubName || "Harness Meeting").trim();
+  return hrnzCanonicalVenue(raw);
+}
+
+
+const hrnzRaceMetaCache=new Map();
+
+function hrnzCanonicalVenue(v){
+  let s=String(v||"").trim();
+  if(/^NZ\s+(Metro|Metropolitan)(\s+TC)?$/i.test(s) || /^Addington(\s+Raceway)?$/i.test(s)) return "ADDINGTON";
+  if(/^Invcargill$/i.test(s) || /^Invercargill$/i.test(s) || /^Ascot\s+Park(\s+Raceway)?$/i.test(s)) return "INVERCARGILL";
+  if(/^WaikBoP$/i.test(s) || /^Waikato\s*Bay\s*of\s*Plenty$/i.test(s) || /^Bay\s*of\s*Plenty$/i.test(s)) return "CAMBRIDGE";
+  return s;
+}
+
+function hrnzExtractStarts(payload){
+  if(Array.isArray(payload)) return payload;
+  const candidates=[
+    payload?.raceStarts,
+    payload?.starts,
+    payload?.data,
+    payload?.data?.raceStarts,
+    payload?.data?.starts,
+    payload?.results,
+    payload?.horseRaceStarts
+  ];
+  for(const x of candidates) if(Array.isArray(x)) return x;
+  return [];
+}
+
+function hrnzRaceHeader(s){
+  return s?.raceHeader || s?.race || s?.raceDetails || {};
+}
+
+function hrnzHorseResult(s){
+  return s?.horseResult || s?.result || {};
+}
+
+async function hrnzFindRaceMetaById(env,raceDate,raceId){
+  const rid=String(raceId||"");
+  if(!rid) return null;
+  if(hrnzRaceMetaCache.has(rid)) return hrnzRaceMetaCache.get(rid);
+  try{
+    const meetingsPayload=await hrnzJSON(env,"/racing/meetings",{
+      startDate:raceDate,endDate:raceDate,meetingType:"OFFICIAL"
+    });
+    const meetings=Array.isArray(meetingsPayload)
+      ? meetingsPayload
+      : (Array.isArray(meetingsPayload?.meetings)?meetingsPayload.meetings:
+         Array.isArray(meetingsPayload?.data)?meetingsPayload.data:
+         Array.isArray(meetingsPayload?.data?.meetings)?meetingsPayload.data.meetings:[]);
+    for(const mh of meetings){
+      const meetingId=mh?.meetingId||mh?.id;
+      if(!meetingId) continue;
+      let detail;
+      try{detail=await hrnzJSON(env,`/racing/meetings/${encodeURIComponent(meetingId)}`)}
+      catch{continue}
+      const races=Array.isArray(detail?.races)
+        ? detail.races
+        : (Array.isArray(detail?.data?.races)?detail.data.races:[]);
+      for(const rh of races){
+        if(String(rh?.raceId||rh?.id||"")===rid){
+          const header=detail?.meetingHeader||detail?.meeting||mh||{};
+          const meta={
+            meetingId:String(meetingId),
+            raceId:String(rh?.raceId||rh?.id||rid),
+            raceNumber:rh?.raceNumber ?? rh?.number ?? rh?.raceNo ?? "",
+            raceDate:header?.meetingDate||header?.date||raceDate,
+            venue:hrnzCanonicalVenue(header?.track?.name||header?.trackName||header?.clubName||""),
+            raceName:rh?.raceName||rh?.raceDescriptionAbbreviated||rh?.name||"",
+            distance:hrnzDistance(rh)
+          };
+          hrnzRaceMetaCache.set(rid,meta);
+          return meta;
+        }
+      }
+    }
+  }catch{}
+  return null;
+}
+
+function hrnzCompactStart(s,meta=null){
+  const rh=hrnzRaceHeader(s);
+  const result=hrnzHorseResult(s);
+
+  const directMeetingId=rh?.meetingId ?? s?.meetingId ?? "";
+  const directRaceId=rh?.raceId ?? s?.raceId ?? "";
+  const directRaceNo=rh?.raceNumber ?? rh?.number ?? rh?.raceNo ?? s?.raceNumber ?? s?.raceNo ?? "";
+  const directDate=rh?.raceDate ?? rh?.meetingDate ?? s?.raceDate ?? s?.date ?? "";
+  const directTrack=rh?.track?.name ?? rh?.trackName ?? s?.track?.name ?? s?.trackName ?? rh?.clubName ?? s?.clubName ?? "";
+
+  const meetingId=String(directMeetingId || meta?.meetingId || "");
+  const raceId=String(directRaceId || meta?.raceId || "");
+  const raceNumber=directRaceNo || meta?.raceNumber || "";
+  const venue=hrnzCanonicalVenue(directTrack || meta?.venue || "");
+  const raceName=rh?.raceName||rh?.raceDescriptionAbbreviated||rh?.raceNameDetails||s?.raceName||meta?.raceName||"";
+  const raceClass=rh?.raceDescriptionAbbreviated||rh?.raceNameDetails||rh?.raceConditions||s?.raceClass||raceName||"";
+
+  return {
+    id:`hrnz:${meetingId}:${raceId}`,
+    meeting_id:meetingId,
+    race_id:raceId,
+    race_number:raceNumber,
+    date:directDate||meta?.raceDate||"",
+    distance:hrnzDistance(rh)||hrnzDistance(s)||meta?.distance||"",
+    track:venue,
+    venue_name:venue,
+    track_condition:rh?.track?.trackCondition||rh?.trackCondition||s?.trackCondition||"",
+    class:raceClass,
+    race_name:raceName,
+    description:raceName,
+    finish:result?.placing ?? result?.position ?? s?.placing ?? "",
+    driver:result?.driver?.driverName||result?.driverName||s?.driver?.driverName||s?.driverName||"",
+    driver_name:result?.driver?.driverName||result?.driverName||s?.driver?.driverName||s?.driverName||"",
+    trainer:result?.trainer?.trainerName||result?.trainerName||s?.trainer?.trainerName||s?.trainerName||"",
+    trainer_name:result?.trainer?.trainerName||result?.trainerName||s?.trainer?.trainerName||s?.trainerName||"",
+    review:"",
+    gait:result?.gaitInUse||rh?.raceGait||s?.raceGait||"",
+    start_type:rh?.startType||s?.startType||"",
+    source:"hrnz",
+    race_number_source:directRaceNo?"horse_start":(meta?.raceNumber?"race_id_lookup":"missing")
+  };
+}
+
+async function hrnzNormalizeStarts(env,payload){
+  const arr=hrnzExtractStarts(payload);
+  const out=[];
+  for(const s of arr){
+    const rh=hrnzRaceHeader(s);
+    const raceId=rh?.raceId ?? s?.raceId ?? "";
+    const raceDate=rh?.raceDate ?? rh?.meetingDate ?? s?.raceDate ?? s?.date ?? "";
+    const raceNo=rh?.raceNumber ?? rh?.number ?? rh?.raceNo ?? s?.raceNumber ?? s?.raceNo ?? "";
+    const meetingId=rh?.meetingId ?? s?.meetingId ?? "";
+    let meta=null;
+    if(!raceNo || !meetingId){
+      meta=await hrnzFindRaceMetaById(env,raceDate,raceId);
+    }
+    out.push(hrnzCompactStart(s,meta));
+  }
+  return out;
+}
+
+async function hrnzHorseStarts(env,horseId){
+  const payload=await hrnzJSON(env,`/equine/horses/${encodeURIComponent(horseId)}/raceStarts`,{
+    raceType:"OFFICIAL",
+    numberOfStarts:20
+  });
+  const starts=await hrnzNormalizeStarts(env,payload);
+  if(!starts.length){
+    const shape=payload && typeof payload==="object" ? Object.keys(payload).slice(0,12) : [];
+    throw new Error(`HRNZ raceStarts returned no usable starts (shape: ${shape.join(",")||typeof payload})`);
+  }
+  return starts;
+}
+
+async function hrnzMeetingsFor(env,date){
+  const list=await hrnzJSON(env,"/racing/meetings",{startDate:date,endDate:date,meetingType:"OFFICIAL"});
+  const arr=Array.isArray(list)?list:[];
+  const out=[];
+  for(const mh of arr){
+    const meetingId=mh.meetingId;
+    let detail=null;
+    try{detail=await hrnzJSON(env,`/racing/meetings/${encodeURIComponent(meetingId)}`)}catch{}
+    const header=detail?.meetingHeader||mh;
+    const races=Array.isArray(detail?.races)?detail.races:[];
+    out.push({
+      id:`hrnz:${meetingId}`,
+      meeting_id:meetingId,
+      name:hrnzMeetingName(header),
+      meeting_name:hrnzMeetingName(header),
+      venue_name:hrnzMeetingName(header),
+      club_name:header?.clubName||"",
+      date:header?.meetingDate||date,
+      track_condition:"",
+      category:"Harness",
+      source:"hrnz",
+      races:races.map(r=>({
+        id:`hrnz:${meetingId}:${r.raceId}`,
+        event_id:`hrnz:${meetingId}:${r.raceId}`,
+        race_id:r.raceId,
+        meeting_id:meetingId,
+        race_number:r.raceNumber,
+        distance:hrnzDistance(r),
+        description:r.raceName||r.raceDescriptionAbbreviated||"",
+        name:r.raceName||r.raceDescriptionAbbreviated||""
+      }))
+    });
+  }
+  return {data:{meetings:out},source:"hrnz"};
+}
+
+function hrnzDecodeHTML(s){
+  return String(s||"")
+    .replace(/&nbsp;/gi," ")
+    .replace(/&amp;/gi,"&")
+    .replace(/&quot;/gi,'"')
+    .replace(/&#39;|&apos;/gi,"'")
+    .replace(/&lt;/gi,"<")
+    .replace(/&gt;/gi,">")
+    .replace(/&#(\d+);/g,(_,n)=>String.fromCharCode(Number(n)));
+}
+
+function hrnzHtmlToLines(html){
+  const t=hrnzDecodeHTML(
+    String(html||"")
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi," ")
+      .replace(/<(br|\/p|\/div|\/tr|\/td|\/li|\/h\d|\/table|\/section|\/article)\b[^>]*>/gi,"\n")
+      .replace(/<[^>]+>/g," ")
+  );
+  return t.split(/\r?\n/)
+    .map(x=>x.replace(/\s+/g," ").trim())
+    .filter(Boolean);
+}
+
+function hrnzRacebookClubPrefix(mh){
+  const direct=mh?.clubId ?? mh?.club?.clubId ?? mh?.club?.id ?? mh?.track?.clubId;
+  if(direct!==undefined && direct!==null && String(direct).match(/^\d+$/)){
+    return String(direct).padStart(2,"0").slice(-2);
+  }
+  const name=String(mh?.clubName||mh?.club?.name||mh?.track?.name||"").toLowerCase();
+  if(name.includes("auckland")) return "02";
+  if(name.includes("waikato") || name.includes("waikbop") || name.includes("bay of plenty")) return "09";
+  return "";
+}
+
+function hrnzDateParts(v){
+  const s=String(v||"");
+  let m=s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if(m)return {dd:m[3],mm:m[2],yy:m[1].slice(2),iso:`${m[1]}-${m[2]}-${m[3]}`};
+  const d=new Date(s);
+  if(isNaN(d))return null;
+  return {
+    dd:String(d.getUTCDate()).padStart(2,"0"),
+    mm:String(d.getUTCMonth()+1).padStart(2,"0"),
+    yy:String(d.getUTCFullYear()).slice(2),
+    iso:d.toISOString().slice(0,10)
+  };
+}
+
+function hrnzRacebookURL(mh,rh){
+  const prefix=hrnzRacebookClubPrefix(mh);
+  const dp=hrnzDateParts(mh?.meetingDate||rh?.raceDate||rh?.meetingDate);
+  const rn=Number(rh?.raceNumber||rh?.number||rh?.raceNo||0);
+  if(!prefix||!dp||!rn)return "";
+  return `https://infohorse.hrnz.co.nz/datahrs/racebook/${prefix}${dp.dd}${dp.mm}${String(rn).padStart(2,"0")}.htm`;
+}
+
+function hrnzMonthNumber(mon){
+  const m={jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12"};
+  return m[String(mon||"").slice(0,3).toLowerCase()]||"";
+}
+
+function hrnzPublicVenue(v){
+  const s=String(v||"").trim();
+  if(/^WaikBoP$/i.test(s) || /^Waikato\s*Bay\s*of\s*Plenty$/i.test(s)) return "CAMBRIDGE";
+  if(/^Invcargill$/i.test(s) || /^Invercargill$/i.test(s)) return "INVERCARGILL";
+  if(/^NZ\s+Metro$/i.test(s)) return "ADDINGTON";
+  return s;
+}
+
+function hrnzParsePublicStartLines(lines){
+  const out=[];
+  for(let i=0;i<lines.length;i++){
+    const fm=lines[i].match(/^(\d{1,2})\s+of\s+(\d{1,2})$/i);
+    if(!fm)continue;
+    let dateIndex=-1;
+    for(let j=i+1;j<Math.min(i+6,lines.length);j++){
+      if(/^\d{1,2}\s+[A-Za-z]{3}\s+\d{2}$/.test(lines[j])){dateIndex=j;break}
+    }
+    if(dateIndex<0)continue;
+    const dm=lines[dateIndex].match(/^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})$/);
+    const mm=hrnzMonthNumber(dm?.[2]);
+    if(!dm||!mm)continue;
+    const date=`20${dm[3]}-${mm}-${String(dm[1]).padStart(2,"0")}`;
+    const venue=hrnzPublicVenue(lines[dateIndex+1]||"");
+    let raceNo="";
+    let raceIndex=-1;
+    for(let j=dateIndex+2;j<Math.min(dateIndex+7,lines.length);j++){
+      const rm=lines[j].match(/^Race\s+(\d+)$/i);
+      if(rm){raceNo=rm[1];raceIndex=j;break}
+      if(/^WORKOUT$/i.test(lines[j]))break;
+    }
+    if(!raceNo)continue;
+
+    // Pull useful descriptors from the short span following Race N.
+    let distance="",condition="",classText="",driver="";
+    const span=lines.slice(raceIndex+1,Math.min(raceIndex+16,lines.length));
+    for(const x of span){
+      if(!distance && /^\d{3,4}m$/i.test(x)) distance=x.replace(/\D/g,"");
+      if(!condition && /^(Fast|Good|Dead|Easy|Slushy|Wet|Heavy|Muddy|Slow)$/i.test(x)) condition=x;
+    }
+    const distPos=span.findIndex(x=>/^\d{3,4}m$/i.test(x));
+    if(distPos>0) classText=span[distPos-1]||"";
+    const videoPos=span.findIndex(x=>/^Video$/i.test(x));
+    if(videoPos>=0 && span[videoPos+1]) driver=span[videoPos+1];
+
+    out.push({
+      id:`public:${date}:${venue}:${raceNo}`,
+      meeting_id:"",
+      race_id:"",
+      race_number:raceNo,
+      date,
+      distance,
+      track:venue,
+      venue_name:venue,
+      track_condition:condition,
+      class:classText,
+      race_name:"",
+      description:classText,
+      finish:fm[1],
+      driver,
+      driver_name:driver,
+      trainer:"",
+      trainer_name:"",
+      review:"",
+      source:"hrnz_public_racebook",
+      race_number_source:"public_racebook"
+    });
+    if(out.length>=10)break;
+  }
+  return out;
+}
+
+async function hrnzPublicHistoryForRunner(env,meetingId,raceId,horseName){
+  const d=await hrnzJSON(env,`/racing/meetings/${encodeURIComponent(meetingId)}/races/${encodeURIComponent(raceId)}`);
+  const mh=d?.meetingHeader||{};
+  const rh=d?.raceHeader||{};
+  const url=hrnzRacebookURL(mh,rh);
+  if(!url) throw new Error("Could not construct HRNZ public racebook URL from meeting data");
+
+  const r=await fetch(url,{headers:{"accept":"text/html,application/xhtml+xml","user-agent":"Mozilla/5.0"}});
+  const html=await r.text();
+  if(!r.ok)throw new Error(`HRNZ public racebook ${r.status}`);
+
+  const lines=hrnzHtmlToLines(html);
+  const target=String(horseName||"").trim().toLowerCase();
+
+  // Find the horse's own Race Starts block. Use the occurrence of the horse name
+  // nearest before a "Race Starts (Last 10)" heading.
+  let bestStart=-1,bestDistance=1e9;
+  for(let i=0;i<lines.length;i++){
+    if(!/^Race Starts\b/i.test(lines[i]))continue;
+    for(let j=Math.max(0,i-80);j<i;j++){
+      if(lines[j].toLowerCase()===target){
+        const dist=i-j;
+        if(dist<bestDistance){bestDistance=dist;bestStart=i}
+      }
+    }
+  }
+  if(bestStart<0){
+    // More tolerant name match for punctuation/spaces.
+    const norm=s=>String(s||"").toLowerCase().replace(/[^a-z0-9]/g,"");
+    for(let i=0;i<lines.length;i++){
+      if(!/^Race Starts\b/i.test(lines[i]))continue;
+      for(let j=Math.max(0,i-80);j<i;j++){
+        if(norm(lines[j])===norm(target)){bestStart=i;break}
+      }
+      if(bestStart>=0)break;
+    }
+  }
+  if(bestStart<0) throw new Error(`Could not find ${horseName} Race Starts block on HRNZ public racebook`);
+
+  let end=lines.length;
+  for(let i=bestStart+1;i<lines.length;i++){
+    if(/^Race Starts\b/i.test(lines[i])){end=i;break}
+  }
+  const starts=hrnzParsePublicStartLines(lines.slice(bestStart+1,end));
+  if(!starts.length)throw new Error(`Found ${horseName} racebook section but could not parse any official race starts`);
+
+  return {url,starts};
+}
+
+async function hrnzCompactEvent(env,meetingId,raceId){
+  const d=await hrnzJSON(env,`/racing/meetings/${encodeURIComponent(meetingId)}/races/${encodeURIComponent(raceId)}`);
+  const mh=d?.meetingHeader||{};
+  const rh=d?.raceHeader||{};
+  const rawRunners=Array.isArray(d?.runners)?d.runners:[];
+  const runners=await Promise.all(rawRunners.map(async x=>{
+    let starts=[],startsError="";
+    const horseId=String(x?.horseId||x?.horse?.horseId||x?.horse?.id||"");
+    if(horseId){
+      try{starts=await hrnzHorseStarts(env,horseId)}
+      catch(err){startsError=err?.message||String(err)}
+    }else{
+      startsError="HRNZ runner had no horseId";
+    }
+    const result=x?.result||x?.horseResult||{};
+    return {
+      entrant_id:horseId,
+      horse_id:horseId,
+      runner_number:x?.bookNumber||x?.runnerNumber||x?.number||"",
+      name:x?.horseName||x?.horse?.horseName||x?.horse?.name||"",
+      is_scratched:!!(x?.scratched||x?.isScratched),
+      jockey:"",
+      driver:x?.driver?.driverName||x?.driverName||"",
+      driver_name:x?.driver?.driverName||x?.driverName||"",
+      trainer:x?.trainer?.trainerName||x?.trainerName||"",
+      trainer_name:x?.trainer?.trainerName||x?.trainerName||"",
+      silk_url_64x64:x?.colours?.coloursURL||x?.colors?.coloursURL||"",
+      silk_url_128x128:x?.colours?.coloursURL||x?.colors?.coloursURL||"",
+      last_twenty_starts:x?.form||"",
+      last_starts:starts,
+      last_starts_error:startsError,
+      form_source:"hrnz",
+      form_comment:x?.formComment||"",
+      form_comment_short:x?.formComment||"",
+      preview:"",
+      result:{
+        position:parseInt(result?.placing||result?.position)||null,
+        runner_number:x?.bookNumber||x?.runnerNumber||x?.number||"",
+        name:x?.horseName||x?.horse?.horseName||x?.horse?.name||""
+      }
+    };
+  }));
+  return {
+    race:{
+      event_id:`hrnz:${meetingId}:${raceId}`,
+      meeting_id:String(meetingId),
+      race_id:String(raceId),
+      meeting_name:hrnzMeetingName(mh),
+      display_meeting_name:hrnzMeetingName(mh),
+      venue_name:hrnzMeetingName(mh),
+      track:hrnzMeetingName(mh),
+      description:rh.raceName||rh.raceDescriptionAbbreviated||"",
+      race_number:rh.raceNumber||"",
+      race_date_nz:mh.meetingDate||rh.meetingDate||"",
+      distance:hrnzDistance(rh),
+      track_condition:mh?.track?.trackCondition||"",
+      class:rh.raceDescriptionAbbreviated||rh.raceConditions||"",
+      country:"NZ",
+      source:"hrnz",
+      gait:rh.raceGait||"",
+      start_type:rh.startType||""
+    },
+    results:runners.filter(x=>x.result?.position).map(x=>({
+      entrant_id:x.entrant_id,
+      runner_number:x.runner_number,
+      name:x.name,
+      position:x.result.position
+    })),
+    runners
+  };
+}
+
+async function eventById(id){ return tabJSON(`${TAB_BASE}/events/${encodeURIComponent(id)}?enc=json`); }
+function getRunners(data){
+  return data?.data?.runners || data?.runners || [];
+}
+function findHorse(data, horseId, horseName){
+  const runners=getRunners(data);
+  const hid=String(horseId||"");
+  const hname=norm(horseName||"");
+  let match=null;
+  if(hid) match=runners.find(r=>String(r.horse_id||"")===hid) || null;
+  if(!match && hname) match=runners.find(r=>norm(r.name)===hname) || null;
+  return match;
+}
+function compactEvent(payload){
+  const d=payload?.data||payload||{}; const race=d.race||{};
+  const res=d.results||[]; const rmap=new Map(res.map(x=>[String(x.runner_number),x]));
+  return {
+    race:{event_id:race.event_id,meeting_id:race.meeting_id,race_id:race.race_id,meeting_name:race.meeting_name,display_meeting_name:race.display_meeting_name,venue_name:race.venue_name,track:race.track,description:race.description,race_number:race.race_number,race_date_nz:race.race_date_nz,distance:race.distance,track_condition:race.track_condition,class:race.class,country:race.country},
+    results:res.map(x=>({entrant_id:x.entrant_id,runner_number:x.runner_number,name:x.name,position:x.position,barrier:x.barrier,margin_length:x.margin_length})),
+    runners:(d.runners||[]).map(x=>({entrant_id:x.entrant_id,horse_id:x.horse_id,runner_number:x.runner_number,name:x.name,is_scratched:x.is_scratched,jockey:x.jockey,driver:x.driver,driver_name:x.driver_name,trainer:x.trainer,trainer_name:x.trainer_name,silk_url_64x64:x.silk_url_64x64,silk_url_128x128:x.silk_url_128x128,last_twenty_starts:x.last_twenty_starts,last_starts:x.last_starts,last_starts_error:x.last_starts_error,form_source:x.form_source,form_comment:x.form_comment,form_comment_short:x.form_comment_short,preview:x.preview,result:rmap.get(String(x.runner_number))||null}))
+  };
+}
+
+export default {
+  async fetch(request, env){
+    const url=new URL(request.url);
+    try{
+      if(url.pathname==="/api/health") return jsonResponse({ok:true,service:"ts-form-vt-edit-builder",version:36});
+      if(url.pathname==="/api/hrnz-bindings"){
+        const names=Object.keys(env||{}).sort();
+        return jsonResponse({
+          ok:true,
+          binding_names:names,
+          has_HRNZ_BASIC_USER:Object.prototype.hasOwnProperty.call(env||{},"HRNZ_BASIC_USER"),
+          has_HRNZ_BASIC_PASS:Object.prototype.hasOwnProperty.call(env||{},"HRNZ_BASIC_PASS")
+        });
+      }
+      if(url.pathname==="/api/hrnz-status"){
+        if(!hrnzConfigured(env)) return jsonResponse({ok:false,configured:false,message:"HRNZ credentials not configured"});
+        try{
+          const key=await hrnzGetKey(env);
+          return jsonResponse({ok:true,configured:true,key_cached:true,expires:new Date(hrnzKeyCache.expires).toISOString()});
+        }catch(err){
+          return jsonResponse({ok:false,configured:true,error:err?.message||String(err)},502);
+        }
+      }
+      if(url.pathname==="/api/hrnz-racebook-history-by-race"){
+        const date=cleanDate(url.searchParams.get("date"));
+        const venue=String(url.searchParams.get("venue")||"").trim();
+        const raceNumber=Number(url.searchParams.get("race_number")||0);
+        const horseName=String(url.searchParams.get("horse_name")||"").trim();
+        if(!date||!venue||!raceNumber||!horseName) return jsonResponse({error:"date, venue, race_number and horse_name required"},400);
+
+        const syntheticMeeting={
+          meetingDate:date,
+          track:{name:venue},
+          clubName:venue
+        };
+        const syntheticRace={raceNumber};
+
+        // Public racebook filename prefixes seen/needed for current NZ harness locations.
+        const venueKey=hrnzCanonicalVenue(venue).toUpperCase();
+        const prefixMap={
+          "ALEXANDRA PARK":"02","AUCKLAND":"02",
+          "CAMBRIDGE":"09","WAIKBOP":"09","BAY OF PLENTY":"09",
+          "ADDINGTON":"03","NZ METRO":"03",
+          "INVERCARGILL":"12","ASCOT PARK":"12",
+          "ASHBURTON":"05","RANGIORA":"04","WINTON":"13",
+          "MANAWATU":"10","RIVERTON":"12"
+        };
+        const prefix=prefixMap[venueKey]||"";
+        if(!prefix) return jsonResponse({error:`No public HRNZ racebook prefix mapped for ${venue}`},400);
+
+        const dp=hrnzDateParts(date);
+        const url=`https://infohorse.hrnz.co.nz/datahrs/racebook/${prefix}${dp.dd}${dp.mm}${String(raceNumber).padStart(2,"0")}.htm`;
+        const rr=await fetch(url,{headers:{"accept":"text/html,application/xhtml+xml","user-agent":"Mozilla/5.0"}});
+        const html=await rr.text();
+        if(!rr.ok) return jsonResponse({error:`HRNZ public racebook ${rr.status}`,url},502);
+
+        const lines=hrnzHtmlToLines(html);
+        const target=String(horseName).trim().toLowerCase();
+        const norm=s=>String(s||"").toLowerCase().replace(/[^a-z0-9]/g,"");
+        let bestStart=-1;
+        for(let i=0;i<lines.length;i++){
+          if(!/^Race Starts\b/i.test(lines[i]))continue;
+          for(let j=Math.max(0,i-80);j<i;j++){
+            if(lines[j].toLowerCase()===target || norm(lines[j])===norm(target)){bestStart=i;break}
+          }
+          if(bestStart>=0)break;
+        }
+        if(bestStart<0) return jsonResponse({error:`Could not find ${horseName} Race Starts block on HRNZ public racebook`,url},502);
+
+        let end=lines.length;
+        for(let i=bestStart+1;i<lines.length;i++){
+          if(/^Race Starts\b/i.test(lines[i])){end=i;break}
+        }
+        const starts=hrnzParsePublicStartLines(lines.slice(bestStart+1,end));
+        if(!starts.length) return jsonResponse({error:`Found ${horseName} section but could not parse race starts`,url},502);
+
+        return jsonResponse({ok:true,source:"hrnz_public_racebook",url,count:starts.length,starts});
+      }
+      if(url.pathname==="/api/hrnz-racebook-history"){
+        const meetingId=String(url.searchParams.get("meeting_id")||"").replace(/\D/g,"");
+        const raceId=String(url.searchParams.get("race_id")||"").replace(/\D/g,"");
+        const horseName=String(url.searchParams.get("horse_name")||"").trim();
+        if(!meetingId||!raceId||!horseName) return jsonResponse({error:"meeting_id, race_id and horse_name required"},400);
+        const p=await hrnzPublicHistoryForRunner(env,meetingId,raceId,horseName);
+        return jsonResponse({ok:true,source:"hrnz_public_racebook",count:p.starts.length,starts:p.starts});
+      }
+      if(url.pathname==="/api/hrnz-runner-history"){
+        const horseId=String(url.searchParams.get("horse_id")||"").replace(/\D/g,"");
+        if(!horseId) return jsonResponse({error:"horse_id required"},400);
+        const starts=await hrnzHorseStarts(env,horseId);
+        return jsonResponse({ok:true,source:"hrnz",horse_id:horseId,count:starts.length,starts});
+      }
+      if(url.pathname==="/api/hrnz-horse-starts-raw"){
+        const horseId=String(url.searchParams.get("horse_id")||"").replace(/\D/g,"");
+        if(!horseId) return jsonResponse({error:"horse_id required"},400);
+        const raw=await hrnzJSON(env,`/equine/horses/${encodeURIComponent(horseId)}/raceStarts`,{
+          raceType:"OFFICIAL",numberOfStarts:12
+        });
+        return jsonResponse({ok:true,horse_id:horseId,is_array:Array.isArray(raw),count:Array.isArray(raw)?raw.length:null,raw});
+      }
+      if(url.pathname==="/api/hrnz-horse-starts"){
+        const horseId=String(url.searchParams.get("horse_id")||"").replace(/\D/g,"");
+        if(!horseId) return jsonResponse({error:"horse_id required"},400);
+        const starts=await hrnzHorseStarts(env,horseId);
+        return jsonResponse({ok:true,horse_id:horseId,count:starts.length,starts});
+      }
+      if(url.pathname==="/api/hrnz-meetings"){
+        const date=cleanDate(url.searchParams.get("date")); if(!date) return jsonResponse({error:"date required YYYY-MM-DD"},400);
+        return jsonResponse(await hrnzMeetingsFor(env,date));
+      }
+      if(url.pathname==="/api/hrnz-event"){
+        const meetingId=String(url.searchParams.get("meeting_id")||"").replace(/\D/g,"");
+        const raceId=String(url.searchParams.get("race_id")||"").replace(/\D/g,"");
+        if(!meetingId||!raceId) return jsonResponse({error:"meeting_id and race_id required"},400);
+        return jsonResponse(await hrnzCompactEvent(env,meetingId,raceId));
+      }
+      if(url.pathname==="/api/meetings"){
+        const date=cleanDate(url.searchParams.get("date")); if(!date) return jsonResponse({error:"date required YYYY-MM-DD"},400);
+        const country=(url.searchParams.get("country")||"NZ").toUpperCase();
+        const category=(url.searchParams.get("category")||"T").toUpperCase()==="H"?"H":"T";
+        if(category==="H" && hrnzConfigured(env)){
+          try{return jsonResponse(await hrnzMeetingsFor(env,date))}
+          catch(err){
+            const tab=await meetingsFor(date,country,category);
+            tab.hrnz_error=err?.message||String(err);
+            tab.source="tab_harness_fallback";
+            return jsonResponse(tab);
+          }
+        }
+        return jsonResponse(await meetingsFor(date,country,category));
+      }
+      if(url.pathname.startsWith("/api/event/")){
+        const id=cleanUUID(url.pathname.slice(11)); if(!id) return jsonResponse({error:"invalid event id"},400);
+        return jsonResponse(compactEvent(await eventById(id)));
+      }
+      if(url.pathname==="/api/resolve-form-race"){
+        const date=cleanDate(url.searchParams.get("date"));
+        const horseId=String(url.searchParams.get("horse_id")||"");
+        const horseName=String(url.searchParams.get("horse_name")||"");
+        const startId=String(url.searchParams.get("start_id")||"");
+        const venue=String(url.searchParams.get("venue")||"");
+        const trackCode=String(url.searchParams.get("track_code")||"");
+        const distance=String(url.searchParams.get("distance")||"").replace(/\D/g,"");
+        const country=(url.searchParams.get("country")||"NZ").toUpperCase();
+        const category=(url.searchParams.get("category")||"T").toUpperCase()==="H"?"H":"T";
+        if(!date || (!horseId && !horseName)) return jsonResponse({error:"date and horse identifier are required"},400);
+
+        const diagnostics={
+          date, venue, track_code:trackCode, distance, category, horse_id:horseId, horse_name:horseName, start_id:startId,
+          direct_id_attempted:false, meetings_found:0, races_checked:0, event_fetch_failures:0,
+          matched_by:null
+        };
+
+        // HRNZ harness starts carry exact meetingId + raceId, so resolve directly with no inference.
+        if(category==="H" && startId.startsWith("hrnz:") && hrnzConfigured(env)){
+          const parts=startId.split(":");
+          const meetingId=String(parts[1]||"").replace(/\D/g,"");
+          const raceId=String(parts[2]||"").replace(/\D/g,"");
+          if(meetingId && raceId){
+            try{
+              const event=await hrnzCompactEvent(env,meetingId,raceId);
+              diagnostics.matched_by="hrnz_exact_meeting_race_id";
+              diagnostics.hrnz_race_number=event?.race?.race_number||null;
+              return jsonResponse({method:"hrnz_exact_race_id",diagnostics,event});
+            }catch(err){
+              diagnostics.hrnz_exact_error=err?.message||String(err);
+            }
+          }
+        }
+
+        // Fast path: last_starts[].id may itself be an event UUID.
+        if(cleanUUID(startId)){
+          diagnostics.direct_id_attempted=true;
+          try{
+            const p=await eventById(startId);
+            const matched=findHorse(p,horseId,horseName);
+            if(matched){
+              diagnostics.matched_by=String(matched.horse_id||"")===horseId && horseId ? "horse_id" : "horse_name";
+              return jsonResponse({method:"start_id",diagnostics,event:compactEvent(p)});
+            }
+          }catch(err){
+            diagnostics.direct_id_error=err?.message||String(err);
+          }
+        }
+
+        // Historical fallback: use /racing/list, which returns individual race IDs + race numbers.
+        // This is more direct than querying meetings for old dates.
+        let raceList=[];
+        try{
+          const lp=await racesFor(date,country,category);
+          raceList=lp?.data?.races || lp?.races || (Array.isArray(lp?.data)?lp.data:[]) || [];
+          diagnostics.race_list_found=raceList.length;
+        }catch(err){
+          diagnostics.race_list_error=err?.message||String(err);
+          diagnostics.race_list_url=err?.upstream||null;
+        }
+
+        // First scan individual historical race summaries if TAB supplies them.
+        for(const race of raceList){
+          const id=cleanUUID(race.id||race.event_id||race.eventId);
+          if(!id) continue;
+          diagnostics.races_checked++;
+          try{
+            const p=await eventById(id);
+            const matched=findHorse(p,horseId,horseName);
+            if(matched){
+              diagnostics.matched_by=String(matched.horse_id||"")===horseId && horseId ? "horse_id" : "horse_name";
+              return jsonResponse({method:"date_race_list_horse",diagnostics,event:compactEvent(p)});
+            }
+          }catch{
+            diagnostics.event_fetch_failures++;
+          }
+        }
+
+        // Another API route exposes races by broadcast channel and explicitly returns
+        // event_id + meeting_name + race_number. This can work when /racing/list rejects an older date.
+        try{
+          const cp=await channelRacesFor(date,category);
+          diagnostics.channel_races_found=cp.races.length;
+          diagnostics.channel_errors=cp.errors;
+          for(const race of cp.races){
+            const id=cleanUUID(race.event_id||race.id);
+            if(!id) continue;
+            diagnostics.races_checked++;
+            try{
+              const p=await eventById(id);
+              const matched=findHorse(p,horseId,horseName);
+              if(matched){
+                diagnostics.matched_by=String(matched.horse_id||"")===horseId && horseId ? "horse_id" : "horse_name";
+                return jsonResponse({method:"date_channel_races_horse",diagnostics,event:compactEvent(p)});
+              }
+            }catch{
+              diagnostics.event_fetch_failures++;
+            }
+          }
+        }catch(err){
+          diagnostics.channel_lookup_error=err?.message||String(err);
+        }
+
+        // Some older dates are rejected by /racing/list. Try the meetings endpoint as another
+        // independent route before falling back to the form data already present in the browser.
+        try{
+          const mp=await meetingsFor(date,country,category);
+          let meetings=mp?.data?.meetings || mp?.meetings || (Array.isArray(mp?.data)?mp.data:[]) || [];
+          diagnostics.meetings_found=meetings.length;
+
+          if(venue){
+            const nv=norm(venue);
+            const preferred=meetings.filter(m=>{
+              const names=[m.name,m.meeting_name,m.display_meeting_name,m.venue_name].filter(Boolean).map(norm);
+              return names.some(n=>n && (n.includes(nv)||nv.includes(n)));
+            });
+            if(preferred.length){
+              const prefSet=new Set(preferred);
+              meetings=[...preferred,...meetings.filter(m=>!prefSet.has(m))];
+            }
+          }
+
+          const possibleRaceSummaries=[];
+          for(const mtg of meetings){
+            const races=mtg.races || mtg.events || [];
+            const mtgNames=[mtg.name,mtg.meeting_name,mtg.display_meeting_name,mtg.venue_name,mtg.jetbet_track_name].filter(Boolean);
+            const venueMatches=!venue || mtgNames.some(n=>{
+              const a=norm(n), b=norm(venue);
+              return a && b && (a.includes(b)||b.includes(a));
+            });
+            for(const race of races){
+              const raceDistance=String(race.distance||"").replace(/\D/g,"");
+              if(venueMatches && (!distance || !raceDistance || raceDistance===distance)){
+                possibleRaceSummaries.push({meeting:mtg,race});
+              }
+
+              const id=cleanUUID(race.id||race.event_id||race.eventId);
+              if(!id) continue;
+              diagnostics.races_checked++;
+              try{
+                const p=await eventById(id);
+                const matched=findHorse(p,horseId,horseName);
+                if(matched){
+                  diagnostics.matched_by=String(matched.horse_id||"")===horseId && horseId ? "horse_id" : "horse_name";
+                  return jsonResponse({method:"date_meeting_horse",diagnostics,event:compactEvent(p)});
+                }
+              }catch{
+                diagnostics.event_fetch_failures++;
+              }
+            }
+          }
+
+          // If TAB will give us the historical meeting but not a usable historical event,
+          // a single race at the matching venue + distance is enough to recover the race number.
+          if(possibleRaceSummaries.length===1){
+            const {meeting,race}=possibleRaceSummaries[0];
+            diagnostics.inferred_race_number=true;
+            return jsonResponse({
+              method:"meeting_venue_distance_inference",
+              fallback:true,
+              inferred:true,
+              diagnostics,
+              event:{
+                race:{
+                  event_id:race.id||race.event_id||"",
+                  meeting_id:meeting.id||meeting.meeting_id||"",
+                  meeting_name:meeting.name||meeting.meeting_name||venue,
+                  display_meeting_name:meeting.name||meeting.display_meeting_name||venue,
+                  venue_name:venue,
+                  description:race.name||race.description||"",
+                  race_number:race.race_number||race.number||"",
+                  race_date_nz:date,
+                  distance:race.distance||distance,
+                  track_condition:race.track_condition||meeting.track_condition||"",
+                  class:"",country
+                },
+                results:[],runners:[]
+              }
+            });
+          }
+          diagnostics.possible_race_summaries=possibleRaceSummaries.length;
+        }catch(err){
+          diagnostics.meetings_error=err?.message||String(err);
+          diagnostics.meetings_url=err?.upstream||null;
+        }
+
+        // Last external NZ fallback: LOVERACING. Only recover historical venue/race number;
+        // TAB remains the source of runner/form data.
+        // Breednet historical lookup: TAB's raw track code is useful as a lookup key.
+        if(country==="NZ" && category==="T" && trackCode){
+          try{
+            const br=await breednetResolve(date,trackCode,horseName,distance,venue);
+            diagnostics.breednet=br;
+            if(br.ok && br.race_number){
+              return jsonResponse({
+                method:"breednet_race_number",
+                fallback:true,
+                inferred:true,
+                diagnostics,
+                event:{
+                  race:{
+                    event_id:"",meeting_id:"",
+                    meeting_name:venue,display_meeting_name:venue,venue_name:venue,track:venue,
+                    description:"",race_number:br.race_number,race_date_nz:date,
+                    distance:Number(distance)||"",track_condition:"",class:"",country
+                  },
+                  results:[],runners:[]
+                }
+              });
+            }
+          }catch(err){ diagnostics.breednet_error=err?.message||String(err); }
+        }
+
+        if(country==="NZ" && category==="T"){
+          try{
+            const lr=await loveRacingResolve(date,venue,distance,horseName);
+            diagnostics.loveracing=lr;
+            if(lr.ok && lr.race_number){
+              return jsonResponse({
+                method:"loveracing_race_number",
+                fallback:true,
+                inferred:true,
+                diagnostics,
+                event:{
+                  race:{
+                    event_id:"",
+                    meeting_id:String(lr.meeting_id||""),
+                    meeting_name:lr.venue||venue,
+                    display_meeting_name:lr.venue||venue,
+                    venue_name:lr.venue||venue,
+                    track:lr.venue||venue,
+                    description:"",
+                    race_number:lr.race_number,
+                    race_date_nz:date,
+                    distance:Number(distance)||"",
+                    track_condition:"",
+                    class:"",
+                    country
+                  },
+                  results:[],runners:[]
+                }
+              });
+            }
+          }catch(err){
+            diagnostics.loveracing_error=err?.message||String(err);
+          }
+        }
+
+        // LOVERACING overview is now the sole external race-number fallback.
+
+        // A 200 fallback response lets the browser construct a useful provisional race from the
+        // selected form start + the other upcoming runners' own form histories.
+        return jsonResponse({
+          method:"form_history_fallback",
+          fallback:true,
+          diagnostics,
+          message:"TAB did not expose a resolvable historical event for this date. Use local form-history cross-match."
+        });
+      }
+      return env.ASSETS.fetch(request);
+    }catch(err){ return jsonResponse({error:err?.message||String(err)},502); }
+  }
+};
